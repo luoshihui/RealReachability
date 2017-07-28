@@ -11,22 +11,30 @@
 #import "LocalConnection.h"
 #import "PingHelper.h"
 #import <UIKit/UIKit.h>
+#import <CoreTelephony/CTTelephonyNetworkInfo.h>
 
 #if (!defined(DEBUG))
 #define NSLog(...)
 #endif
 
-#define kDefaultHost @"www.baidu.com"
-#define kDefaultCheckInterval 1.0f
+#define kDefaultHost @"www.apple.com"
+#define kDefaultCheckInterval 2.0f
+#define kDefaultPingTimeout 2.0f
+
+#define kMinAutoCheckInterval 0.3f
+#define kMaxAutoCheckInterval 60.0f
 
 NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChangedNotification";
 
 @interface RealReachability()
-
 @property (nonatomic, strong) FSMEngine *engine;
-
 @property (nonatomic, assign) BOOL isNotifying;
 
+@property (nonatomic,strong) NSArray *typeStrings4G;
+@property (nonatomic,strong) NSArray *typeStrings3G;
+@property (nonatomic,strong) NSArray *typeStrings2G;
+
+@property (nonatomic, assign) ReachabilityStatus previousStatus;
 @end
 
 @implementation RealReachability
@@ -40,8 +48,23 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
         _engine = [[FSMEngine alloc] init];
         [_engine start];
         
+        _typeStrings2G = @[CTRadioAccessTechnologyEdge,
+                           CTRadioAccessTechnologyGPRS,
+                           CTRadioAccessTechnologyCDMA1x];
+        
+        _typeStrings3G = @[CTRadioAccessTechnologyHSDPA,
+                           CTRadioAccessTechnologyWCDMA,
+                           CTRadioAccessTechnologyHSUPA,
+                           CTRadioAccessTechnologyCDMAEVDORev0,
+                           CTRadioAccessTechnologyCDMAEVDORevA,
+                           CTRadioAccessTechnologyCDMAEVDORevB,
+                           CTRadioAccessTechnologyeHRPD];
+        
+        _typeStrings4G = @[CTRadioAccessTechnologyLTE];
+        
         _hostForPing = kDefaultHost;
         _autoCheckInterval = kDefaultCheckInterval;
+        _pingTimeout = kDefaultPingTimeout;
         
         [[NSNotificationCenter defaultCenter] addObserver:self
                                                  selector:@selector(appBecomeActive)
@@ -94,6 +117,7 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
     }
     
     self.isNotifying = YES;
+    self.previousStatus = RealStatusUnknown;
     
     NSDictionary *inputDic = @{kEventKeyID:@(RREventLoad)};
     [self.engine receiveInput:inputDic];
@@ -103,13 +127,25 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
                                              selector:@selector(localConnectionChanged:)
                                                  name:kLocalConnectionChangedNotification
                                                object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(localConnectionInitialized:)
+                                                 name:kLocalConnectionInitializedNotification
+                                               object:nil];
     
     GPingHelper.host = _hostForPing;
+    GPingHelper.timeout = self.pingTimeout;
     [self autoCheckReachability];
 }
 
 - (void)stopNotifier
 {
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:kLocalConnectionChangedNotification
+                                                  object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:kLocalConnectionInitializedNotification
+                                                  object:nil];
+    
     NSDictionary *inputDic = @{kEventKeyID:@(RREventUnLoad)};
     [self.engine receiveInput:inputDic];
     
@@ -120,8 +156,19 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
 
 #pragma mark - outside invoke
 
-- (void)reachabilityWithBlock:(void (^)(ReachabilityStatus))asyncHandler
+- (void)reachabilityWithBlock:(void (^)(ReachabilityStatus status))asyncHandler
 {
+    // logic optimization: no need to ping when Local connection unavailable!
+    if ([GLocalConnection currentLocalConnectionStatus] == LC_UnReachable)
+    {
+        if (asyncHandler != nil)
+        {
+            asyncHandler(RealStatusNotReachable);
+        }
+        return;
+    }
+    
+    ReachabilityStatus status = [self currentReachabilityStatus];
     __weak __typeof(self)weakSelf = self;
     [GPingHelper pingWithBlock:^(BOOL isSuccess)
      {
@@ -130,12 +177,15 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
          NSInteger rtn = [strongSelf.engine receiveInput:inputDic];
          if (rtn == 0) // state changed & state available, post notification.
          {
-             if ([self.engine isCurrentStateAvailable])
+             if ([strongSelf.engine isCurrentStateAvailable])
              {
+                 strongSelf.previousStatus = status;
                  // this makes sure the change notification happens on the MAIN THREAD
+                 __weak __typeof(strongSelf)deepWeakSelf = strongSelf;
                  dispatch_async(dispatch_get_main_queue(), ^{
+                     __strong __typeof(deepWeakSelf)deepStrongSelf = deepWeakSelf;
                      [[NSNotificationCenter defaultCenter] postNotificationName:kRealReachabilityChangedNotification
-                                                                         object:self];
+                                                                         object:deepStrongSelf];
                  });
              }
          }
@@ -204,12 +254,43 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
     }
 }
 
+- (ReachabilityStatus)previousReachabilityStatus
+{
+    return self.previousStatus;
+}
+
 - (void)setHostForPing:(NSString *)hostForPing
 {
     _hostForPing = nil;
     _hostForPing = [hostForPing copy];
     
     GPingHelper.host = _hostForPing;
+}
+
+- (void)setPingTimeout:(NSTimeInterval)pingTimeout {
+    _pingTimeout = pingTimeout;
+    GPingHelper.timeout = pingTimeout;
+}
+
+- (WWANAccessType)currentWWANtype
+{
+    if ([[[UIDevice currentDevice] systemVersion] floatValue] >= 7.0)
+    {
+        CTTelephonyNetworkInfo *teleInfo= [[CTTelephonyNetworkInfo alloc] init];
+        NSString *accessString = teleInfo.currentRadioAccessTechnology;
+        if ([accessString length] > 0)
+        {
+            return [self accessTypeForString:accessString];
+        }
+        else
+        {
+            return WWANTypeUnknown;
+        }
+    }
+    else
+    {
+        return WWANTypeUnknown;
+    }
 }
 
 #pragma mark - inner methods
@@ -246,7 +327,18 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
         return;
     }
     
-    dispatch_time_t time = dispatch_time(DISPATCH_TIME_NOW, self.autoCheckInterval*60*NSEC_PER_SEC);
+    if (self.autoCheckInterval < kMinAutoCheckInterval)
+    {
+        self.autoCheckInterval = kMinAutoCheckInterval;
+    }
+    
+    if (self.autoCheckInterval > kMaxAutoCheckInterval)
+    {
+        self.autoCheckInterval = kMaxAutoCheckInterval;
+    }
+    
+    
+    dispatch_time_t time = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(self.autoCheckInterval*60*NSEC_PER_SEC));
     __weak __typeof(self)weakSelf = self;
     dispatch_after(time, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         __strong __typeof(weakSelf)strongSelf = weakSelf;
@@ -255,12 +347,33 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
     });
 }
 
+- (WWANAccessType)accessTypeForString:(NSString *)accessString
+{
+    if ([self.typeStrings4G containsObject:accessString])
+    {
+        return WWANType4G;
+    }
+    else if ([self.typeStrings3G containsObject:accessString])
+    {
+        return WWANType3G;
+    }
+    else if ([self.typeStrings2G containsObject:accessString])
+    {
+        return WWANType2G;
+    }
+    else
+    {
+        return WWANTypeUnknown;
+    }
+}
+
 #pragma mark - Notification observer
 - (void)localConnectionChanged:(NSNotification *)notification
 {
     LocalConnection *lc = (LocalConnection *)notification.object;
     LocalConnectionStatus lcStatus = [lc currentLocalConnectionStatus];
-    NSLog(@"currentLocalConnectionStatus:%@",@(lcStatus));
+    //NSLog(@"currentLocalConnectionStatus:%@",@(lcStatus));
+    ReachabilityStatus status = [self currentReachabilityStatus];
     
     NSDictionary *inputDic = @{kEventKeyID:@(RREventLocalConnectionCallback), kEventKeyParam:[self paramValueFromStatus:lcStatus]};
     NSInteger rtn = [self.engine receiveInput:inputDic];
@@ -269,12 +382,34 @@ NSString *const kRealReachabilityChangedNotification = @"kRealReachabilityChange
     {
         if ([self.engine isCurrentStateAvailable])
         {
+            self.previousStatus = status;
             // already in main thread.
             [[NSNotificationCenter defaultCenter] postNotificationName:kRealReachabilityChangedNotification
                                                                 object:self];
-            // To make sure your reachability is "Real".
-            [self reachabilityWithBlock:nil];
+            
+            if (lcStatus != LC_UnReachable)
+            {
+                // To make sure your reachability is "Real".
+                [self reachabilityWithBlock:nil];
+            }
         }
+    }
+}
+
+- (void)localConnectionInitialized:(NSNotification *)notification
+{
+    LocalConnection *lc = (LocalConnection *)notification.object;
+    LocalConnectionStatus lcStatus = [lc currentLocalConnectionStatus];
+    NSLog(@"localConnectionInitializedStatus:%@",@(lcStatus));
+    
+    NSDictionary *inputDic = @{kEventKeyID:@(RREventLocalConnectionCallback), kEventKeyParam:[self paramValueFromStatus:lcStatus]};
+    NSInteger rtn = [self.engine receiveInput:inputDic];
+    
+    // Initialized state, ping once to check the reachability(if local status reachable).
+    if ((rtn == 0) && [self.engine isCurrentStateAvailable] && (lcStatus != LC_UnReachable))
+    {
+        // To make sure your reachability is "Real".
+        [self reachabilityWithBlock:nil];
     }
 }
 
